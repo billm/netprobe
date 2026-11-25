@@ -1,6 +1,7 @@
 """Canned responders for protocols the lab has no real server for.
 
-TCP 21 and 587: FTP and SMTP greetings. UDP 137: NetBIOS node status. UDP 623: IPMI channel auth
+TCP 21 and 587: FTP and SMTP greetings. TCP 25: an SMTP server that answers VRFY
+for root only and accepts any recipient (an open relay). UDP 137: NetBIOS node status. UDP 623: IPMI channel auth
 capabilities. UDP 1434: SQL Server Browser instance list.
 """
 
@@ -58,9 +59,49 @@ def banner_server(port: int, banner: bytes) -> None:
         conn.close()
 
 
+SMTP_REPLIES = {
+    "EHLO": "250-netprobe-lab\r\n250-PIPELINING\r\n250-STARTTLS\r\n250 SIZE 10240000",
+    "EXPN": "502 5.5.1 EXPN not implemented",
+    "MAIL": "250 2.1.0 Ok",
+    "RCPT": "250 2.1.5 Ok",
+    "RSET": "250 2.0.0 Ok",
+    "QUIT": "221 2.0.0 Bye",
+}
+
+
+def smtp_session(conn: socket.socket) -> None:
+    with conn, conn.makefile("rb") as lines:
+        conn.sendall(b"220 netprobe-lab ESMTP fake\r\n")
+        for raw in lines:
+            command = raw.decode("ascii", "replace").strip()
+            verb = command.split(" ")[0].upper()
+            if verb == "VRFY":
+                reply = (
+                    "252 2.0.0 root"
+                    if command.endswith(" root")
+                    else "550 5.1.1 unknown"
+                )
+            else:
+                reply = SMTP_REPLIES.get(verb, "500 5.5.2 unrecognized")
+            conn.sendall(reply.encode("ascii") + b"\r\n")
+            if verb == "QUIT":
+                return
+
+
+def smtp_server() -> None:
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", 25))
+    srv.listen(16)
+    while True:
+        conn, _ = srv.accept()
+        threading.Thread(target=smtp_session, args=(conn,), daemon=True).start()
+
+
 def main() -> None:
     for port, handler in ((137, nbns_reply), (623, ipmi_reply), (1434, mssql_reply)):
         threading.Thread(target=udp_server, args=(port, handler), daemon=True).start()
+    threading.Thread(target=smtp_server, daemon=True).start()
     smtp = (587, b"220 netprobe-lab ESMTP ready\r\n")
     threading.Thread(target=banner_server, args=smtp, daemon=True).start()
     banner_server(21, b"220 netprobe-lab FTP ready\r\n")

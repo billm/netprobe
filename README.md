@@ -76,6 +76,26 @@ whether it completed or was killed. It saves the same text as `<UTC stamp>-summa
 
 A full TCP sweep is slow on purpose: 65,535 ports on one host at 50/s is about 22 minutes.
 
+## Service checks
+
+Per-host checks for the services discovery found. Each writes `<UTC stamp>-<check>.csv` one
+row per host as it goes (a killed run keeps its rows) and a `.txt` summary, and takes
+`-Resume` to skip hosts an earlier run of the same check recorded.
+
+```powershell
+Invoke-NpSmbCheck    -Targets (Get-NpHost -Port 445)
+Invoke-NpLdapCheck   -Targets (Get-NpHost -Port 389)
+Invoke-NpSmtpCheck   -Targets (Get-NpHost -Port 25)
+Invoke-NpTelnetCheck -Targets (Get-NpHost -Port 23)
+```
+
+| Check | What it does |
+|---|---|
+| `Invoke-NpSmbCheck` | SMB2 NEGOTIATE (dialect; signing enabled or required) and SMB1 NEGOTIATE (supported, and its signing), no credentials. On Windows also `net use \\host\IPC$` with an empty user, then as `guest`, both with an empty password, listing shares through each connection that succeeds and removing it afterwards. `-NoLogon` skips the `net use` part |
+| `Invoke-NpLdapCheck` | Anonymous bind; RootDSE (host name, naming context, domain and forest functional levels); an anonymous one-level search of the naming context (5 entries at most); one unsigned simple bind as a made-up `cn=netprobe-invalid-...` user: `strongerAuthRequired` (8) means the server requires signing, `invalidCredentials` (49) means it checked the credentials without requiring it. Channel binding needs valid credentials and isn't tested |
+| `Invoke-NpSmtpCheck` | Greeting; EHLO (STARTTLS, AUTH); `VRFY root` against a random unknown user (different answers suggest user enumeration); `EXPN root`; `MAIL FROM:<netprobe@example.com>` and `RCPT TO:<netprobe@example.net>` (accepted means an open-relay candidate). Ends with RSET and QUIT before DATA, so no mail is sent |
+| `Invoke-NpTelnetCheck` | Refuses every Telnet option the server offers and records the greeting and login prompt. Sends no credentials |
+
 ## Output
 
 Each scan writes to `$HOME\Documents\netpen\`:
@@ -115,8 +135,11 @@ Get-Content $log.FullName -Tail 40
    (`PSScriptAnalyzerSettings.psd1`)
 3. ruff on the lab's Python
 4. `test/run-tests.ps1` in PowerShell 7 against a Docker lab: one host with SSH, nginx (HTTP
-   and TLS), Redis, FTP and SMTP (587) greetings, dnsmasq, tftp-hpa, chrony, net-snmp and canned
-   NetBIOS/IPMI/SQL Browser responders; and one host with nothing listening
+   and TLS), Redis, FTP and SMTP (587) greetings, dnsmasq, tftp-hpa, chrony, net-snmp, Samba
+   (signing mandatory, SMB1 off), OpenLDAP (anonymous read), busybox telnetd, an SMTP server
+   on 25 that leaks users through VRFY and relays, and canned NetBIOS/IPMI/SQL Browser
+   responders; and one host with nothing listening
 
-The lab runs on Linux, where unconnected UDP sockets don't see ICMP port unreachable, so the
-`closed` UDP state is only exercised on Windows.
+The lab runs on Linux, so some paths are only exercised on Windows: the `closed` UDP state
+(unconnected sockets there don't see ICMP port unreachable) and the `net use` null and guest
+session checks.

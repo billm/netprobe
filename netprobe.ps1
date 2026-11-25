@@ -384,6 +384,227 @@ namespace NetProbe
         }
     }
 
+    public class SmbResult
+    {
+        public string Host; public string Smb2Dialect; public string Smb2Signing;
+        public string Smb1; public string Smb1Signing; public string Error;
+    }
+
+    // SMB2 and SMB1 NEGOTIATE on 445: dialect, signing (enabled/required) and SMBv1 support.
+    // Negotiation only: no session setup, no credentials.
+    public static class SmbProbe
+    {
+        public static SmbResult Probe(string host, int timeoutMs)
+        {
+            var r = new SmbResult();
+            r.Host = host;
+            try { ParseSmb2(Exchange(host, timeoutMs, Smb2Negotiate()), r); }
+            catch (Exception e) { r.Error = "smb2: " + e.Message; }
+            try { ParseSmb1(Exchange(host, timeoutMs, Smb1Negotiate()), r); }
+            catch (Exception e) { r.Smb1 = "no (" + e.Message + ")"; }
+            return r;
+        }
+
+        static void ParseSmb2(byte[] b, SmbResult r)
+        {
+            if (b.Length > 4 && b[0] == 0xff && b[1] == (byte)'S')
+            {
+                r.Smb2Dialect = "none (server answered with SMB1)";
+                return;
+            }
+            if (b.Length < 70 || b[0] != 0xfe || b[1] != (byte)'S')
+                throw new InvalidDataException("not an SMB2 reply: " + Text.Hex(b, b.Length, 16));
+            uint status = BitConverter.ToUInt32(b, 8);
+            if (status != 0)
+            {
+                r.Smb2Dialect = "error 0x" + status.ToString("x8");
+                return;
+            }
+            int mode = BitConverter.ToUInt16(b, 66);
+            int dialect = BitConverter.ToUInt16(b, 68);
+            r.Smb2Dialect = DialectName(dialect);
+            r.Smb2Signing = Signing((mode & 0x02) != 0, (mode & 0x01) != 0);
+        }
+
+        static void ParseSmb1(byte[] b, SmbResult r)
+        {
+            if (b.Length > 4 && b[0] == 0xfe && b[1] == (byte)'S')
+            {
+                r.Smb1 = "no (server answered with SMB2)";
+                return;
+            }
+            if (b.Length < 36 || b[0] != 0xff || b[1] != (byte)'S' || b[4] != 0x72)
+                throw new InvalidDataException("not an SMB1 reply: " + Text.Hex(b, b.Length, 16));
+            uint status = BitConverter.ToUInt32(b, 5);
+            int index = BitConverter.ToUInt16(b, 33);
+            if (status != 0 || b[32] != 17 || index == 0xffff)
+            {
+                r.Smb1 = "no (NT LM 0.12 refused, status 0x" + status.ToString("x8") + ")";
+                return;
+            }
+            r.Smb1 = "yes (NT LM 0.12)";
+            r.Smb1Signing = Signing((b[35] & 0x08) != 0, (b[35] & 0x04) != 0);
+        }
+
+        static string Signing(bool required, bool enabled)
+        {
+            if (required) return "required";
+            return enabled ? "enabled, not required" : "disabled";
+        }
+
+        static string DialectName(int d)
+        {
+            switch (d)
+            {
+                case 0x0202: return "2.0.2";
+                case 0x0210: return "2.1";
+                case 0x0300: return "3.0";
+                case 0x0302: return "3.0.2";
+                case 0x0311: return "3.1.1";
+                case 0x02ff: return "2.??";
+            }
+            return "0x" + d.ToString("x4");
+        }
+
+        static byte[] Smb2Negotiate()
+        {
+            var header = new byte[64];
+            header[0] = 0xfe; header[1] = (byte)'S'; header[2] = (byte)'M'; header[3] = (byte)'B';
+            header[4] = 64;   // StructureSize
+            header[14] = 1;   // CreditRequest
+            ushort[] dialects = { 0x0202, 0x0210, 0x0300, 0x0302 };
+            var body = new MemoryStream();
+            // StructureSize 36, dialect count, SecurityMode signing enabled, reserved, capabilities
+            var fixedPart = new byte[] { 36, 0, (byte)dialects.Length, 0, 1, 0, 0, 0, 0, 0, 0, 0 };
+            body.Write(fixedPart, 0, fixedPart.Length);
+            body.Write(Guid.NewGuid().ToByteArray(), 0, 16);
+            body.Write(new byte[8], 0, 8);
+            foreach (var d in dialects) body.Write(BitConverter.GetBytes(d), 0, 2);
+            return NetBios(header, body.ToArray());
+        }
+
+        static byte[] Smb1Negotiate()
+        {
+            var header = new byte[32];
+            header[0] = 0xff; header[1] = (byte)'S'; header[2] = (byte)'M'; header[3] = (byte)'B';
+            header[4] = 0x72;                    // SMB_COM_NEGOTIATE
+            header[9] = 0x18;                    // Flags: case-insensitive, canonical paths
+            header[10] = 0x01; header[11] = 0xc8; // Flags2: long names, NT status, Unicode
+            byte[] dialect = Encoding.ASCII.GetBytes("\u0002NT LM 0.12\u0000");
+            var body = new MemoryStream();
+            body.WriteByte(0); // WordCount
+            body.Write(BitConverter.GetBytes((ushort)dialect.Length), 0, 2);
+            body.Write(dialect, 0, dialect.Length);
+            return NetBios(header, body.ToArray());
+        }
+
+        static byte[] NetBios(byte[] header, byte[] body)
+        {
+            int len = header.Length + body.Length;
+            var packet = new byte[4 + len];
+            packet[1] = (byte)(len >> 16); packet[2] = (byte)(len >> 8); packet[3] = (byte)len;
+            Array.Copy(header, 0, packet, 4, header.Length);
+            Array.Copy(body, 0, packet, 4 + header.Length, body.Length);
+            return packet;
+        }
+
+        static byte[] Exchange(string host, int timeoutMs, byte[] request)
+        {
+            using (var client = new TcpClient(AddressFamily.InterNetwork))
+            {
+                IAsyncResult ar = client.BeginConnect(IPAddress.Parse(host), 445, null, null);
+                if (!ar.AsyncWaitHandle.WaitOne(timeoutMs))
+                    throw new TimeoutException("connect timeout");
+                client.EndConnect(ar);
+                client.ReceiveTimeout = timeoutMs;
+                client.SendTimeout = timeoutMs;
+                Stream s = client.GetStream();
+                s.Write(request, 0, request.Length);
+                byte[] nb = ReadExact(s, 4);
+                int len = (nb[1] << 16) | (nb[2] << 8) | nb[3];
+                if (len > 65536) throw new InvalidDataException("reply length " + len);
+                return ReadExact(s, len);
+            }
+        }
+
+        static byte[] ReadExact(Stream s, int n)
+        {
+            var b = new byte[n];
+            int off = 0;
+            while (off < n)
+            {
+                int k = s.Read(b, off, n - off);
+                if (k <= 0) throw new IOException("connection closed");
+                off += k;
+            }
+            return b;
+        }
+    }
+
+    // Reads a Telnet server's greeting, refusing every option it offers (DO -> WONT,
+    // WILL -> DONT), until a login prompt appears, the server goes quiet, or the timeout ends.
+    public static class TelnetProbe
+    {
+        public static string Banner(string host, int port, int timeoutMs)
+        {
+            using (var client = new TcpClient(AddressFamily.InterNetwork))
+            {
+                IAsyncResult ar = client.BeginConnect(IPAddress.Parse(host), port, null, null);
+                if (!ar.AsyncWaitHandle.WaitOne(timeoutMs))
+                    throw new TimeoutException("connect timeout");
+                client.EndConnect(ar);
+                NetworkStream s = client.GetStream();
+                var text = new List<byte>();
+                var buf = new byte[1024];
+                var total = Stopwatch.StartNew();
+                var idle = Stopwatch.StartNew();
+                while (total.ElapsedMilliseconds < timeoutMs && text.Count < 600)
+                {
+                    if (!s.DataAvailable)
+                    {
+                        if (text.Count > 0 && idle.ElapsedMilliseconds > 1500) break;
+                        Thread.Sleep(50);
+                        continue;
+                    }
+                    int n = s.Read(buf, 0, buf.Length);
+                    if (n <= 0) break;
+                    idle.Restart();
+                    byte[] reply = Negotiate(buf, n, text);
+                    if (reply.Length > 0) s.Write(reply, 0, reply.Length);
+                    string seen = Encoding.ASCII.GetString(text.ToArray());
+                    if (seen.Contains("ogin:") || seen.Contains("assword:")) break;
+                }
+                byte[] all = text.ToArray();
+                return Text.Clean(all, 0, all.Length, 600);
+            }
+        }
+
+        static byte[] Negotiate(byte[] buf, int n, List<byte> text)
+        {
+            var reply = new MemoryStream();
+            for (int i = 0; i < n; i++)
+            {
+                if (buf[i] != 0xff) { text.Add(buf[i]); continue; }
+                if (i + 1 >= n) break;
+                byte cmd = buf[++i];
+                if (cmd >= 251 && cmd <= 254 && i + 1 < n)
+                {
+                    byte opt = buf[++i];
+                    // Refuse everything: DO gets WONT, WILL gets DONT.
+                    if (cmd == 253) reply.Write(new byte[] { 0xff, 252, opt }, 0, 3);
+                    else if (cmd == 251) reply.Write(new byte[] { 0xff, 254, opt }, 0, 3);
+                }
+                else if (cmd == 250)
+                {
+                    // Subnegotiation: skip to IAC SE.
+                    while (i + 1 < n && !(buf[i] == 0xff && buf[i + 1] == 240)) i++;
+                    i++;
+                }
+            }
+            return reply.ToArray();
+        }
+    }
+
     public class TraceRun
     {
         public string File; public string Kind; public DateTime Started; public DateTime Last;
@@ -1170,6 +1391,382 @@ function Show-NpSummary {
   Set-Content -LiteralPath "$base.txt" -Value $lines -Encoding UTF8
   $lines | Write-Host
   Write-Host "Saved $base.txt"
+}
+
+function Select-NpPendingHost {
+  # With -Resume, drops hosts already recorded in an earlier <stamp>-<Kind>.csv.
+  param([string[]]$Targets, [string]$Kind, [bool]$Resume)
+  if (-not $Resume -or -not (Test-Path -LiteralPath $NpOutDir)) { return , [string[]]$Targets }
+  $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+  foreach ($f in @(Get-ChildItem -LiteralPath $NpOutDir -Filter "*-$Kind.csv")) {
+    foreach ($r in (Import-Csv -LiteralPath $f.FullName)) { [void]$seen.Add($r.Host) }
+  }
+  $todo = [string[]]@($Targets | Where-Object { -not $seen.Contains($_) })
+  $already = $Targets.Count - $todo.Count
+  Write-Host ('Resume: {0} of {1} hosts already checked' -f $already, $Targets.Count)
+  return , $todo
+}
+
+function Start-NpCheck {
+  # Output base and run header for a per-host check.
+  param([string]$Kind, [string]$Command, [string[]]$Targets, [hashtable]$Settings)
+  $base = New-NpOutputBase $Kind
+  $Settings['targets'] = $Targets.Count
+  Write-NpRunHeader -Base $base -Command $Command -Settings $Settings
+  return $base
+}
+
+function Add-NpCheckRow {
+  # Appends one result row to the check's CSV straight away, so a killed run keeps it.
+  param([string]$Base, $Row)
+  $Row | Export-Csv -LiteralPath "$Base.csv" -Append -NoTypeInformation -Encoding UTF8
+}
+
+function Complete-NpCheck {
+  param([string]$Base, [string[]]$Lines)
+  $all = @("# finished $((Get-Date).ToUniversalTime().ToString('u'))") + $Lines
+  Add-Content -LiteralPath "$Base.txt" -Value $all -Encoding UTF8
+  $all | Write-Host
+  Write-Host "Saved $Base.csv and $Base.txt"
+}
+
+function Invoke-NpNative {
+  # Runs a built-in Windows program with an exact argument string. Returns its exit code,
+  # its non-empty output lines, and those lines joined on one line.
+  param([string]$File, [string]$Arguments, [int]$TimeoutMs = 30000)
+  $psi = New-Object System.Diagnostics.ProcessStartInfo($File, $Arguments)
+  $psi.UseShellExecute = $false
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError = $true
+  $psi.CreateNoWindow = $true
+  $p = [System.Diagnostics.Process]::Start($psi)
+  $out = $p.StandardOutput.ReadToEndAsync()
+  $err = $p.StandardError.ReadToEndAsync()
+  if (-not $p.WaitForExit($TimeoutMs)) {
+    $p.Kill()
+    return @{ Code = -1; Output = "timed out after $TimeoutMs ms"; Lines = @() }
+  }
+  $lines = @(($out.Result + "`n" + $err.Result) -split "`r?`n" | Where-Object { $_.Trim() })
+  return @{ Code = $p.ExitCode; Output = ($lines -join ' | '); Lines = $lines }
+}
+
+function Test-NpSmbLogon {
+  # Connects to \\host\IPC$ as the given user with an empty password, lists shares through
+  # that connection, then disconnects. Windows only (net.exe).
+  param([string]$Ip, [string]$User)
+  $ipc = '\\{0}\IPC$' -f $Ip
+  $use = Invoke-NpNative -File 'net.exe' -Arguments ('use {0} "" /user:"{1}"' -f $ipc, $User)
+  if ($use.Code -ne 0) { return @{ Result = "refused: $($use.Output)"; Shares = '' } }
+  $view = Invoke-NpNative -File 'net.exe' -Arguments ('view \\{0} /all' -f $Ip)
+  [void](Invoke-NpNative -File 'net.exe' -Arguments ('use {0} /delete /y' -f $ipc))
+  if ($view.Code -ne 0) {
+    return @{ Result = 'allowed'; Shares = "listing refused: $($view.Output)" }
+  }
+  $shares = New-Object System.Collections.Generic.List[string]
+  $inTable = $false
+  foreach ($line in $view.Lines) {
+    if ($line -match '^-{5,}') { $inTable = $true; continue }
+    if ($line -match '^The command completed') { break }
+    if ($inTable) { $shares.Add((($line.Trim() -split '\s{2,}')[0])) }
+  }
+  return @{ Result = 'allowed'; Shares = ($shares -join '; ') }
+}
+
+function Invoke-NpSmbCheck {
+  <#
+  .SYNOPSIS
+    SMB on 445: SMB2 dialect and signing (enabled/required), SMBv1 support and its signing,
+    and on Windows, null-session and guest access to IPC$ with share listing.
+  .DESCRIPTION
+    The negotiate checks send no credentials. The logon checks run net.exe: "net use
+    \\host\IPC$" with an empty user name, then as "guest", both with an empty password. Each
+    connection that succeeds is used to list shares, then removed. -NoLogon skips them.
+  #>
+  param(
+    [Parameter(Mandatory = $true)][string[]]$Targets,
+    [int]$TimeoutMs = 3000,
+    [switch]$NoLogon,
+    [switch]$Resume
+  )
+  Assert-NpInScope $Targets
+  $todo = Select-NpPendingHost -Targets $Targets -Kind 'smb' -Resume $Resume
+  $onWindows = [Environment]::OSVersion.Platform -eq 'Win32NT'
+  $logon = $onWindows -and -not $NoLogon
+  $base = Start-NpCheck -Kind 'smb' -Command 'Invoke-NpSmbCheck' -Targets $todo -Settings @{
+    timeout_ms = $TimeoutMs; logon_checks = $logon
+  }
+  $skipped = @{ Result = 'not run (-NoLogon)'; Shares = '' }
+  if (-not $onWindows) { $skipped = @{ Result = 'not run (needs Windows)'; Shares = '' } }
+  $lines = New-Object System.Collections.Generic.List[string]
+  $i = 0
+  foreach ($ip in $todo) {
+    $i++
+    Write-Progress -Activity 'SMB checks' -Status $ip -PercentComplete (100 * $i / $todo.Count)
+    $r = [NetProbe.SmbProbe]::Probe($ip, $TimeoutMs)
+    $anon = $skipped
+    $guest = $skipped
+    if ($logon) {
+      $anon = Test-NpSmbLogon -Ip $ip -User ''
+      $guest = Test-NpSmbLogon -Ip $ip -User 'guest'
+    }
+    Add-NpCheckRow -Base $base -Row ([pscustomobject]@{
+        Host = $ip; Smb2Dialect = $r.Smb2Dialect; Smb2Signing = $r.Smb2Signing
+        Smb1 = $r.Smb1; Smb1Signing = $r.Smb1Signing
+        NullSession = $anon.Result; NullShares = $anon.Shares
+        GuestSession = $guest.Result; GuestShares = $guest.Shares; Error = $r.Error
+      })
+    $lines.Add(('{0,-15} SMB2 {1}, signing {2}; SMB1 {3}' -f $ip, $r.Smb2Dialect, $r.Smb2Signing,
+        $r.Smb1))
+    if ($r.Error) { $lines.Add("                {0}" -f $r.Error) }
+    $lines.Add(('                null: {0} {1}' -f $anon.Result, $anon.Shares))
+    $lines.Add(('                guest: {0} {1}' -f $guest.Result, $guest.Shares))
+  }
+  Write-Progress -Activity 'SMB checks' -Completed
+  Complete-NpCheck -Base $base -Lines $lines.ToArray()
+}
+
+function Get-NpLdapValue {
+  param($Entry, [string]$Name)
+  if (-not $Entry.Attributes.Contains($Name)) { return '' }
+  return (@($Entry.Attributes[$Name].GetValues([string])) -join ',')
+}
+
+function Test-NpLdapHost {
+  # Anonymous bind, RootDSE read, an anonymous search of the domain, and an unsigned simple bind
+  # with made-up credentials (a server that requires signing answers strongerAuthRequired).
+  param([string]$Ip, [int]$TimeoutMs)
+  $p = 'System.DirectoryServices.Protocols'
+  $row = [ordered]@{ Host = $Ip; AnonymousBind = ''; DnsHostName = ''; NamingContext = ''
+    DomainLevel = ''; ForestLevel = ''; AnonymousSearch = ''; UnsignedSimpleBind = ''; Error = '' }
+  $id = New-Object "$p.LdapDirectoryIdentifier"($Ip, 389)
+  $conn = New-Object "$p.LdapConnection"($id)
+  try {
+    $conn.AuthType = [System.DirectoryServices.Protocols.AuthType]::Anonymous
+    $conn.SessionOptions.ProtocolVersion = 3
+    $conn.Timeout = [TimeSpan]::FromMilliseconds($TimeoutMs)
+    $conn.Bind()
+    $row.AnonymousBind = 'allowed'
+    $attrs = [string[]]@('dnsHostName', 'defaultNamingContext', 'namingContexts',
+      'domainFunctionality', 'forestFunctionality')
+    $req = New-Object "$p.SearchRequest"('', '(objectClass=*)', 'Base', $attrs)
+    $rootDse = $conn.SendRequest($req).Entries[0]
+    $row.DnsHostName = Get-NpLdapValue $rootDse 'dnsHostName'
+    $row.NamingContext = Get-NpLdapValue $rootDse 'defaultNamingContext'
+    if (-not $row.NamingContext -and $rootDse.Attributes.Contains('namingContexts')) {
+      # Non-AD servers publish only namingContexts; use the first.
+      $row.NamingContext = @($rootDse.Attributes['namingContexts'].GetValues([string]))[0]
+    }
+    $row.DomainLevel = Get-NpLdapValue $rootDse 'domainFunctionality'
+    $row.ForestLevel = Get-NpLdapValue $rootDse 'forestFunctionality'
+    if ($row.NamingContext) {
+      $search = New-Object "$p.SearchRequest"($row.NamingContext, '(objectClass=*)', 'OneLevel',
+        [string[]]@('distinguishedName'))
+      $search.SizeLimit = 5
+      try {
+        $found = $conn.SendRequest($search).Entries.Count
+        $row.AnonymousSearch = "allowed: $found entries returned (limit 5)"
+      } catch [System.DirectoryServices.Protocols.DirectoryOperationException] {
+        $resp = $_.Exception.Response
+        $row.AnonymousSearch = "refused: $($resp.ResultCode) $($resp.ErrorMessage)"
+      }
+    }
+  } catch {
+    $row.Error = $_.Exception.Message
+  } finally {
+    $conn.Dispose()
+  }
+  $row.UnsignedSimpleBind = Test-NpLdapUnsignedBind -Ip $Ip -TimeoutMs $TimeoutMs
+  return [pscustomobject]$row
+}
+
+function Test-NpLdapUnsignedBind {
+  param([string]$Ip, [int]$TimeoutMs)
+  $p = 'System.DirectoryServices.Protocols'
+  $id = New-Object "$p.LdapDirectoryIdentifier"($Ip, 389)
+  # A DN-shaped name, so AD and other servers check it rather than reject its syntax.
+  $user = 'cn=netprobe-invalid-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+  $cred = New-Object System.Net.NetworkCredential($user, [guid]::NewGuid().ToString('N'))
+  $basic = [System.DirectoryServices.Protocols.AuthType]::Basic
+  $conn = New-Object "$p.LdapConnection"($id, $cred, $basic)
+  try {
+    $conn.SessionOptions.ProtocolVersion = 3
+    $conn.Timeout = [TimeSpan]::FromMilliseconds($TimeoutMs)
+    $conn.Bind()
+    return 'bind accepted with made-up credentials'
+  } catch [System.DirectoryServices.Protocols.LdapException] {
+    $e = $_.Exception
+    $meaning = 'other'
+    if ($e.ErrorCode -eq 49) { $meaning = 'signing not required (invalid credentials checked)' }
+    if ($e.ErrorCode -eq 8) { $meaning = 'signing required (strongerAuthRequired)' }
+    return ('{0}: code {1} {2}' -f $meaning, $e.ErrorCode, $e.ServerErrorMessage).Trim()
+  } catch {
+    return "error: $($_.Exception.Message)"
+  } finally {
+    $conn.Dispose()
+  }
+}
+
+function Invoke-NpLdapCheck {
+  <#
+  .SYNOPSIS
+    LDAP on 389: anonymous bind and RootDSE (host name, naming context, functional levels),
+    whether an anonymous search of the domain returns entries, and whether an unsigned simple
+    bind is refused for lack of signing.
+  .DESCRIPTION
+    The signing check binds once per host as a random non-existent user with a random
+    password; the server's answer shows whether it requires signing before checking the
+    credentials. Channel binding needs valid domain credentials and is not tested.
+  #>
+  param(
+    [Parameter(Mandatory = $true)][string[]]$Targets,
+    [int]$TimeoutMs = 5000,
+    [switch]$Resume
+  )
+  Assert-NpInScope $Targets
+  Add-Type -AssemblyName System.DirectoryServices.Protocols
+  $todo = Select-NpPendingHost -Targets $Targets -Kind 'ldap' -Resume $Resume
+  $base = Start-NpCheck -Kind 'ldap' -Command 'Invoke-NpLdapCheck' -Targets $todo -Settings @{
+    timeout_ms = $TimeoutMs
+  }
+  $lines = New-Object System.Collections.Generic.List[string]
+  foreach ($ip in $todo) {
+    $r = Test-NpLdapHost -Ip $ip -TimeoutMs $TimeoutMs
+    Add-NpCheckRow -Base $base -Row $r
+    $lines.Add(('{0,-15} {1} ({2}), domain level {3}, forest level {4}' -f $ip, $r.DnsHostName,
+        $r.NamingContext, $r.DomainLevel, $r.ForestLevel))
+    $lines.Add(('                anonymous bind: {0}; anonymous search: {1}' -f $r.AnonymousBind,
+        $r.AnonymousSearch))
+    $lines.Add(('                unsigned simple bind: {0}' -f $r.UnsignedSimpleBind))
+    if ($r.Error) { $lines.Add("                error: $($r.Error)") }
+  }
+  Complete-NpCheck -Base $base -Lines $lines.ToArray()
+}
+
+function Read-NpSmtpReply {
+  # One SMTP reply, which may span several "250-..." lines.
+  param([System.IO.StreamReader]$Reader)
+  $lines = New-Object System.Collections.Generic.List[string]
+  while ($true) {
+    $line = $Reader.ReadLine()
+    if ($null -eq $line) { break }
+    $lines.Add($line)
+    if ($line.Length -lt 4 -or $line[3] -ne '-') { break }
+  }
+  return ($lines -join ' | ')
+}
+
+function Test-NpSmtpHost {
+  # Greeting, EHLO capabilities, VRFY/EXPN, and whether an external recipient is accepted.
+  # Ends with RSET and QUIT before any DATA, so no mail is sent.
+  param([string]$Ip, [int]$Port, [int]$TimeoutMs)
+  $row = [ordered]@{ Host = $Ip; Port = $Port; Banner = ''; Ehlo = ''; StartTls = ''
+    VrfyRoot = ''; VrfyUnknown = ''; ExpnRoot = ''; MailFrom = ''; RcptExternal = ''
+    UserEnum = ''; Relay = ''; Error = '' }
+  $client = New-Object System.Net.Sockets.TcpClient
+  try {
+    $ar = $client.BeginConnect([System.Net.IPAddress]::Parse($Ip), $Port, $null, $null)
+    if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs)) { throw 'connect timeout' }
+    $client.EndConnect($ar)
+    $client.ReceiveTimeout = $TimeoutMs
+    $stream = $client.GetStream()
+    $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::ASCII)
+    $writer = New-Object System.IO.StreamWriter($stream, [System.Text.Encoding]::ASCII)
+    $writer.NewLine = "`r`n"
+    $writer.AutoFlush = $true
+    $send = { param($cmd) $writer.WriteLine($cmd); return Read-NpSmtpReply $reader }
+    $row.Banner = Read-NpSmtpReply $reader
+    $row.Ehlo = & $send 'EHLO netprobe.invalid'
+    $row.StartTls = [string]($row.Ehlo -match 'STARTTLS')
+    $row.VrfyRoot = & $send 'VRFY root'
+    $row.VrfyUnknown = & $send ('VRFY netprobe' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $row.ExpnRoot = & $send 'EXPN root'
+    $row.MailFrom = & $send 'MAIL FROM:<netprobe@example.com>'
+    $row.RcptExternal = & $send 'RCPT TO:<netprobe@example.net>'
+    [void](& $send 'RSET')
+    [void](& $send 'QUIT')
+  } catch {
+    $row.Error = $_.Exception.Message
+  } finally {
+    $client.Close()
+  }
+  $codeRoot = ([string]$row.VrfyRoot).Split(' ')[0]
+  $codeUnknown = ([string]$row.VrfyUnknown).Split(' ')[0]
+  $row.UserEnum = 'no (VRFY answers do not differ)'
+  if ($codeRoot -match '^25[02]$' -and $codeUnknown -match '^55\d$') {
+    $row.UserEnum = "likely: VRFY root $codeRoot, unknown user $codeUnknown"
+  }
+  $row.Relay = 'no'
+  if ([string]$row.RcptExternal -match '^25[01]') {
+    $row.Relay = 'candidate: external RCPT accepted'
+  }
+  return [pscustomobject]$row
+}
+
+function Invoke-NpSmtpCheck {
+  <#
+  .SYNOPSIS
+    SMTP: greeting, EHLO capabilities (STARTTLS, AUTH), VRFY/EXPN user enumeration, and an
+    open-relay check (example.com sender to an example.net recipient). No mail is sent: the
+    session ends with RSET and QUIT before DATA.
+  #>
+  param(
+    [Parameter(Mandatory = $true)][string[]]$Targets,
+    [int]$Port = 25,
+    [int]$TimeoutMs = 10000,
+    [switch]$Resume
+  )
+  Assert-NpInScope $Targets
+  $todo = Select-NpPendingHost -Targets $Targets -Kind 'smtp' -Resume $Resume
+  $base = Start-NpCheck -Kind 'smtp' -Command 'Invoke-NpSmtpCheck' -Targets $todo -Settings @{
+    port = $Port; timeout_ms = $TimeoutMs
+  }
+  $lines = New-Object System.Collections.Generic.List[string]
+  foreach ($ip in $todo) {
+    $r = Test-NpSmtpHost -Ip $ip -Port $Port -TimeoutMs $TimeoutMs
+    Add-NpCheckRow -Base $base -Row $r
+    $lines.Add(('{0}:{1}  {2}' -f $ip, $Port, $r.Banner))
+    $lines.Add(('  EHLO: {0}' -f $r.Ehlo))
+    $lines.Add(('  STARTTLS {0}; user enum {1}; relay {2}' -f $r.StartTls, $r.UserEnum, $r.Relay))
+    $lines.Add(('  VRFY root: {0} | unknown: {1} | EXPN root: {2}' -f $r.VrfyRoot,
+        $r.VrfyUnknown, $r.ExpnRoot))
+    $lines.Add(('  MAIL FROM: {0} | RCPT external: {1}' -f $r.MailFrom, $r.RcptExternal))
+    if ($r.Error) { $lines.Add("  error: $($r.Error)") }
+  }
+  Complete-NpCheck -Base $base -Lines $lines.ToArray()
+}
+
+function Invoke-NpTelnetCheck {
+  <#
+  .SYNOPSIS
+    Telnet: the greeting and login prompt, after refusing every option the server offers. No
+    credentials are sent.
+  #>
+  param(
+    [Parameter(Mandatory = $true)][string[]]$Targets,
+    [int]$Port = 23,
+    [int]$TimeoutMs = 8000,
+    [switch]$Resume
+  )
+  Assert-NpInScope $Targets
+  $todo = Select-NpPendingHost -Targets $Targets -Kind 'telnet' -Resume $Resume
+  $base = Start-NpCheck -Kind 'telnet' -Command 'Invoke-NpTelnetCheck' -Targets $todo -Settings @{
+    port = $Port; timeout_ms = $TimeoutMs
+  }
+  $lines = New-Object System.Collections.Generic.List[string]
+  foreach ($ip in $todo) {
+    $banner = ''
+    $err = ''
+    try { $banner = [NetProbe.TelnetProbe]::Banner($ip, $Port, $TimeoutMs) }
+    catch {
+      $e = $_.Exception
+      if ($e.InnerException) { $e = $e.InnerException }
+      $err = $e.Message
+    }
+    Add-NpCheckRow -Base $base -Row ([pscustomobject]@{
+        Host = $ip; Port = $Port; Banner = $banner; Error = $err })
+    $lines.Add(('{0,-15} {1}/tcp {2}{3}' -f $ip, $Port, $banner, $err))
+  }
+  Complete-NpCheck -Base $base -Lines $lines.ToArray()
 }
 
 function Start-NpSession {

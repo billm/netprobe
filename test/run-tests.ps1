@@ -169,7 +169,7 @@ Check 'stress: 8,000 probes with grabs finish, with no crash log' {
   $txt = Get-Content ($csv.FullName -replace '\.csv$', '.txt') -Raw
   $ends = @(Get-Content ($csv.FullName -replace '\.csv$', '-trace.log') |
       Where-Object { $_ -match ' end tcp ' })
-  ($txt -match 'closed 7994, open 6') -and ($ends.Count -eq 8000) -and
+  ($txt -match 'closed 7989, open 11') -and ($ends.Count -eq 8000) -and
   -not (Test-Path (Join-Path $NpOutDir 'netprobe-crash.log'))
 }
 
@@ -252,6 +252,57 @@ Check 'summary groups services by check, merging TCP and UDP' {
 }
 Check 'summary lists each open service once despite repeat scans' {
   @($summary | Where-Object { $_ -match "^\s+$lab\s+22/tcp " }).Count -eq 1
+}
+
+Invoke-NpSmbCheck -Targets $targets
+$smb = @(Import-Csv (Get-LatestOutput '*-smb.csv').FullName)
+$smbLab = $smb | Where-Object Host -eq $lab
+$smbEmpty = $smb | Where-Object Host -eq $empty
+Check 'SMB negotiate reads the dialect and mandatory signing (Samba)' {
+  ($smbLab.Smb2Dialect -eq '3.0.2') -and ($smbLab.Smb2Signing -eq 'required') -and
+  (-not $smbLab.Error)
+}
+Check 'SMB1 refused by a server with SMB1 off' { $smbLab.Smb1 -like 'no (*' }
+Check 'null and guest checks are skipped off Windows, and say so' {
+  ($smbLab.NullSession -eq 'not run (needs Windows)') -and
+  ($smbLab.GuestSession -eq 'not run (needs Windows)')
+}
+Check 'SMB on a host with nothing listening records the error' {
+  ($smbEmpty.Smb2Dialect -eq '') -and ($smbEmpty.Error -like 'smb2:*')
+}
+Invoke-NpSmbCheck -Targets $targets -Resume
+Check 'SMB -Resume skips hosts already checked' {
+  (Get-Content (Get-LatestOutput '*-smb.txt').FullName) -contains '# targets = 0'
+}
+
+Invoke-NpLdapCheck -Targets @($lab)
+$ldap = Import-Csv (Get-LatestOutput '*-ldap.csv').FullName
+Check 'LDAP anonymous bind and RootDSE naming context' {
+  ($ldap.AnonymousBind -eq 'allowed') -and ($ldap.NamingContext -eq 'dc=netprobe,dc=test')
+}
+Check 'LDAP anonymous search of the naming context is reported' {
+  $ldap.AnonymousSearch -eq 'allowed: 1 entries returned (limit 5)'
+}
+Check 'LDAP unsigned simple bind with made-up credentials gets invalidCredentials' {
+  $ldap.UnsignedSimpleBind -like 'signing not required (invalid credentials checked): code 49*'
+}
+
+Invoke-NpSmtpCheck -Targets @($lab)
+$smtp = Import-Csv (Get-LatestOutput '*-smtp.csv').FullName
+Check 'SMTP greeting, EHLO and STARTTLS' {
+  ($smtp.Banner -eq '220 netprobe-lab ESMTP fake') -and ($smtp.StartTls -eq 'True') -and
+  ($smtp.Ehlo -like '250-netprobe-lab | *250 SIZE 10240000')
+}
+Check 'SMTP VRFY user enumeration and relay candidate detected' {
+  ($smtp.UserEnum -eq 'likely: VRFY root 252, unknown user 550') -and
+  ($smtp.Relay -eq 'candidate: external RCPT accepted') -and (-not $smtp.Error)
+}
+
+Invoke-NpTelnetCheck -Targets @($lab)
+$telnet = Import-Csv (Get-LatestOutput '*-telnet.csv').FullName
+Check 'Telnet greeting read after option negotiation' {
+  ($telnet.Banner -match 'netprobe-lab telnet') -and ($telnet.Banner -match 'login:') -and
+  (-not $telnet.Error)
 }
 
 if ($script:failures -gt 0) { Write-Host "$script:failures check(s) failed"; exit 1 }
