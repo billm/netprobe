@@ -59,16 +59,19 @@ Invoke-NpPing     -Targets $t
 Invoke-NpTcpScan  -Targets $t            # 75 common ports
 Invoke-NpUdpProbe -Targets $t
 
-# All TCP ports on hosts that had something open
-$csv = Get-ChildItem $HOME\Documents\netpen\*-tcp.csv | Select-Object -Last 1
-$live = Import-Csv $csv.FullName | Select-Object -ExpandProperty Host -Unique
-Invoke-NpTcpScan -Targets $live -Ports '1-65535'
+Show-NpSummary                           # every open service so far, grouped by check
+$smb = Get-NpHost -Port 139, 445         # hosts for the next phase's checks
 ```
+
+`Show-NpSummary` merges every scan's CSVs (partial runs included, each service listed once)
+and groups open services by the checks they feed: SMB, LDAP, SSH, SNMP, databases, web, and
+so on. It also lists each traced run with its start time, duration, probes finished, and
+whether it completed or was killed. It saves the same text as `<UTC stamp>-summary.txt`.
 
 | Command | Defaults | Main options |
 |---|---|---|
 | `Invoke-NpPing` | 20/s, 16 at a time, 1000 ms timeout | `-Rate -Concurrency -TimeoutMs` |
-| `Invoke-NpTcpScan` | 50/s, 32 at a time, 1500 ms timeout, `$NpDefaultPorts` | `-Ports 22,80,'8000-8100'` or `'1-65535'`, `-NoGrab` |
+| `Invoke-NpTcpScan` | 50/s, 32 at a time, 1500 ms timeout, `$NpDefaultPorts` | `-Ports 22,80,'8000-8100'` or `'1-65535'`, `-NoGrab`, `-Resume` |
 | `Invoke-NpUdpProbe` | 20/s, 16 at a time, 2000 ms timeout, all probes | `-Probes snmp,ipmi`, `-Community` |
 
 A full TCP sweep is slow on purpose: 65,535 ports on one host at 50/s is about 22 minutes.
@@ -93,6 +96,9 @@ TCP states: `open`, `closed` (refused), `filtered` (timeout or other error).
 - `-Trace` on any scan writes `<UTC stamp>-<scan>-trace.log`: a timestamped line as each probe
   starts and ends, flushed as written. After a kill, the `start` lines without a matching `end`
   are the probes in flight. Expect about 100 bytes per probe.
+- `Invoke-NpTcpScan -Resume` skips every host:port probe that an earlier traced run finished,
+  so a killed scan carries on where it stopped. It implies `-Trace`, so each resumed run can be
+  resumed in turn.
 
 ```powershell
 $log = Get-ChildItem $HOME\Documents\netpen\*-trace.log | Select-Object -Last 1

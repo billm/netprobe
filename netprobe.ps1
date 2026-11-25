@@ -33,11 +33,48 @@ $NpTlsPorts = @(443, 465, 636, 993, 995, 3269, 5986, 6443, 8443, 9443)
 $NpHttpPorts = @(80, 81, 443, 3000, 5000, 5601, 5985, 5986, 6443, 8000, 8008, 8080, 8081, 8443,
   8888, 9000, 9090, 9200, 9443, 10000)
 
+# Service groups for Show-NpSummary, named for the methodology checks each one feeds.
+$NpServiceGroups = @(
+  @{ Name = 'FTP: anonymous login, versions'; Tcp = @(21, 2121); Udp = @() },
+  @{ Name = 'SSH: versions, algorithms, auth methods'; Tcp = @(22); Udp = @() },
+  @{ Name = 'Telnet and r-services (legacy, unencrypted)'; Tcp = @(23, 512, 513, 514); Udp = @() },
+  @{ Name = 'SMTP: versions, encryption, user enum, relay'; Tcp = @(25, 465, 587); Udp = @() },
+  @{ Name = 'DNS'; Tcp = @(53); Udp = @(53) },
+  @{ Name = 'TFTP'; Tcp = @(); Udp = @(69) },
+  @{ Name = 'Kerberos (likely domain controllers)'; Tcp = @(88); Udp = @() },
+  @{ Name = 'POP3'; Tcp = @(110, 995); Udp = @() },
+  @{ Name = 'IMAP'; Tcp = @(143, 993); Udp = @() },
+  @{ Name = 'NFS and RPC'; Tcp = @(111, 2049); Udp = @() },
+  @{ Name = 'NTP'; Tcp = @(); Udp = @(123) },
+  @{ Name = 'SMB, MSRPC, NetBIOS: signing, null sessions, shares'; Tcp = @(135, 139, 445)
+    Udp = @(137) },
+  @{ Name = 'SNMP'; Tcp = @(); Udp = @(161) },
+  @{ Name = 'LDAP: signing, channel binding, anonymous bind'; Tcp = @(389, 636, 3268, 3269)
+    Udp = @() },
+  @{ Name = 'IPMI'; Tcp = @(623); Udp = @(623) },
+  @{ Name = 'Printers'; Tcp = @(515, 631, 9100); Udp = @() },
+  @{ Name = 'MSSQL'; Tcp = @(1433); Udp = @(1434) },
+  @{ Name = 'Oracle'; Tcp = @(1521); Udp = @() },
+  @{ Name = 'MySQL'; Tcp = @(3306); Udp = @() },
+  @{ Name = 'PostgreSQL'; Tcp = @(5432); Udp = @() },
+  @{ Name = 'Redis'; Tcp = @(6379); Udp = @() },
+  @{ Name = 'Other databases and caches'; Tcp = @(9200, 11211, 27017); Udp = @() },
+  @{ Name = 'RDP'; Tcp = @(3389); Udp = @() },
+  @{ Name = 'VNC'; Tcp = @(5800, 5900, 5901); Udp = @() },
+  @{ Name = 'X11'; Tcp = @(6000); Udp = @() },
+  @{ Name = 'WinRM'; Tcp = @(5985, 5986); Udp = @() },
+  @{ Name = 'Docker and Kubernetes APIs'; Tcp = @(2375, 2376, 6443); Udp = @() },
+  @{ Name = 'Web (apps, Tomcat, Jenkins, Webmin, phpMyAdmin)'; Udp = @()
+    Tcp = @(80, 81, 443, 3000, 5000, 5601, 7001, 8000, 8008, 8009, 8080, 8081, 8443, 8888, 9000,
+      9090, 9443, 10000) }
+)
+
 $NpSource = @'
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Net;
 using System.Net.NetworkInformation;
@@ -66,6 +103,8 @@ namespace NetProbe
         public bool Grab = true;
         public int[] TlsPorts = new int[0];
         public int[] HttpPorts = new int[0];
+        // "host:port" probes finished in earlier runs; a resumed scan skips them.
+        public HashSet<string> Skip;
     }
 
     public class UdpOptions : ScanOptions
@@ -262,7 +301,11 @@ namespace NetProbe
 
         public static Job Tcp(string[] hosts, int[] ports, TcpOptions o, string csvPath)
         {
-            var job = new Job(hosts.Length * ports.Length, o, csvPath, TcpResult.Header);
+            int total = 0;
+            foreach (var p in ports)
+                foreach (var h in hosts)
+                    if (!Skipped(o, h, p)) total++;
+            var job = new Job(total, o, csvPath, TcpResult.Header);
             job.Start(TcpWork(job, hosts, ports, o));
             return job;
         }
@@ -273,6 +316,11 @@ namespace NetProbe
             var job = new Job(hosts.Length * probes.Length, o, csvPath, UdpResult.Header);
             job.Start(UdpWork(job, hosts, probes, o));
             return job;
+        }
+
+        static bool Skipped(TcpOptions o, string host, int port)
+        {
+            return o.Skip != null && o.Skip.Contains(host + ":" + port);
         }
 
         static IEnumerable<Func<object>> PingWork(Job job, string[] hosts, ScanOptions o)
@@ -300,6 +348,7 @@ namespace NetProbe
                 bool http = Array.IndexOf(o.HttpPorts, p) >= 0;
                 foreach (var h in hosts)
                 {
+                    if (Skipped(o, h, p)) continue;
                     string host = h; int port = p;
                     yield return delegate
                     {
@@ -331,6 +380,70 @@ namespace NetProbe
                         return r;
                     };
                 }
+            }
+        }
+    }
+
+    public class TraceRun
+    {
+        public string File; public string Kind; public DateTime Started; public DateTime Last;
+        public int Total; public int Ended; public bool EndLine;
+        public double Seconds { get { return (Last - Started).TotalSeconds; } }
+        public string Outcome
+        {
+            get
+            {
+                if (!EndLine) return "killed (no end line)";
+                return Ended >= Total ? "complete" : "stopped";
+            }
+        }
+    }
+
+    // Reads -Trace logs: one TraceRun per file, and every finished TCP probe ("host:port").
+    // A process killed mid-write can leave a truncated last line; it is not counted.
+    public static class TraceLog
+    {
+        public static List<TraceRun> Read(string[] paths, HashSet<string> doneTcp)
+        {
+            var runs = new List<TraceRun>();
+            foreach (var path in paths)
+            {
+                var run = new TraceRun();
+                run.File = Path.GetFileName(path);
+                var share = FileShare.ReadWrite | FileShare.Delete;
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, share))
+                using (var reader = new StreamReader(fs))
+                {
+                    string line;
+                    while ((line = reader.ReadLine()) != null) Parse(line, run, doneTcp);
+                }
+                runs.Add(run);
+            }
+            return runs;
+        }
+
+        // <UTC time> t<thread> <event>, e.g. "... t7 end tcp 10.1.0.5:445 closed"
+        static void Parse(string line, TraceRun run, HashSet<string> doneTcp)
+        {
+            string[] f = line.Split(' ');
+            if (f.Length < 4) return;
+            DateTime when;
+            var styles = DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal;
+            if (!DateTime.TryParseExact(f[0], "yyyy-MM-dd'T'HH:mm:ss.fff'Z'",
+                CultureInfo.InvariantCulture, styles, out when)) return;
+            if (run.Started == DateTime.MinValue) run.Started = when;
+            run.Last = when;
+            int n;
+            if (f[2] == "job" && f[3] == "start," && f.Length > 4 && int.TryParse(f[4], out n))
+                run.Total = n;
+            else if (f[2] == "job" && f[3] == "end,")
+                run.EndLine = true;
+            else if (f[2] == "start" && run.Kind == null)
+                run.Kind = f[3];
+            else if (f[2] == "end" && f.Length >= 6)
+            {
+                run.Ended++;
+                if (f[3] == "tcp" && doneTcp != null) doneTcp.Add(f[4]);
             }
         }
     }
@@ -875,8 +988,13 @@ function New-NpOutputBase {
   if (-not (Test-Path -LiteralPath $NpOutDir)) {
     New-Item -ItemType Directory -Path $NpOutDir | Out-Null
   }
-  $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
-  return Join-Path $NpOutDir "$stamp-$Name"
+  # Millisecond stamps sort in start order; wait out a clash rather than overwrite a run.
+  while ($true) {
+    $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffZ')
+    $base = Join-Path $NpOutDir "$stamp-$Name"
+    if (-not (Test-Path -LiteralPath "$base.txt")) { return $base }
+    Start-Sleep -Milliseconds 5
+  }
 }
 
 function Write-NpRunHeader {
@@ -941,6 +1059,119 @@ function Write-NpSummary {
   Write-Host "Saved $Base.csv and $Base.txt"
 }
 
+function Get-NpTraceFile {
+  # Every -Trace log in the output folder, oldest first. The leading comma keeps an empty or
+  # one-element array from being unrolled on return.
+  $files = @()
+  if (Test-Path -LiteralPath $NpOutDir) {
+    $files = @(Get-ChildItem -LiteralPath $NpOutDir -Filter '*-trace.log' |
+        Sort-Object Name | ForEach-Object { $_.FullName })
+  }
+  return , [string[]]$files
+}
+
+function Get-NpOpenService {
+  <#
+  .SYNOPSIS
+    Every open TCP port and answering UDP service in all scan CSVs so far (partial runs
+    included), one row per host, protocol and port.
+  #>
+  $rows = @{}
+  $files = @()
+  if (Test-Path -LiteralPath $NpOutDir) {
+    $files = @(Get-ChildItem -LiteralPath $NpOutDir -Filter '*.csv')
+  }
+  foreach ($f in $files) {
+    $isTcp = $f.Name -like '*-tcp.csv'
+    if (-not $isTcp -and $f.Name -notlike '*-udp.csv') { continue }
+    foreach ($r in (Import-Csv -LiteralPath $f.FullName)) {
+      if ($isTcp) {
+        $detail = $r.Banner
+        if ($r.TlsSubject) { $detail = "[$($r.TlsProtocol)] $($r.TlsSubject) $detail" }
+        $row = [pscustomobject]@{ Host = $r.Host; Protocol = 'tcp'; Port = [int]$r.Port
+          Service = ''; Detail = $detail }
+      } elseif ($r.State -eq 'open') {
+        $row = [pscustomobject]@{ Host = $r.Host; Protocol = 'udp'; Port = [int]$r.Port
+          Service = $r.Probe; Detail = $r.Detail }
+      } else { continue }
+      $key = '{0}/{1}/{2}' -f $row.Protocol, $row.Host, $row.Port
+      if (-not $rows.ContainsKey($key) -or (-not $rows[$key].Detail -and $row.Detail)) {
+        $rows[$key] = $row
+      }
+    }
+  }
+  return @($rows.Values | Sort-Object { ConvertTo-NpUInt32 $_.Host }, Protocol, Port)
+}
+
+function Get-NpHost {
+  <#
+  .SYNOPSIS
+    Hosts with any of the given ports open in any scan so far, e.g. $smb = Get-NpHost -Port 445.
+  #>
+  param(
+    [Parameter(Mandatory = $true)][int[]]$Port,
+    [ValidateSet('tcp', 'udp')][string]$Protocol = 'tcp'
+  )
+  $open = @(Get-NpOpenService |
+      Where-Object { $_.Protocol -eq $Protocol -and $Port -contains $_.Port })
+  return @($open | ForEach-Object { $_.Host } | Select-Object -Unique)
+}
+
+function Format-NpServiceLine {
+  param($Service)
+  $detail = [string]$Service.Detail
+  if ($detail.Length -gt 110) { $detail = $detail.Substring(0, 110) + '...' }
+  return '  {0,-15} {1,5}/{2} {3}' -f $Service.Host, $Service.Port, $Service.Protocol, $detail
+}
+
+function Show-NpSummary {
+  <#
+  .SYNOPSIS
+    Prints and saves (<UTC stamp>-summary.txt) the traced runs, each with start time,
+    duration, probes finished and whether it completed or was killed; then every open
+    service found so far, grouped by the checks it feeds.
+  #>
+  $lines = New-Object System.Collections.Generic.List[string]
+  $lines.Add("# netprobe summary $((Get-Date).ToUniversalTime().ToString('u'))")
+  $done = New-Object 'System.Collections.Generic.HashSet[string]'
+  $runs = [NetProbe.TraceLog]::Read((Get-NpTraceFile), $done)
+  $lines.Add('')
+  $lines.Add("== Traced runs: $($runs.Count); TCP host:port probes finished: $($done.Count)")
+  foreach ($r in $runs) {
+    $lines.Add(('  {0}  {1} {2:HH:mm:ss}-{3:HH:mm:ss}Z {4,7:N0} s  {5} of {6}  {7}' -f
+        $r.File, $r.Kind, $r.Started, $r.Last, $r.Seconds, $r.Ended, $r.Total, $r.Outcome))
+  }
+  $services = Get-NpOpenService
+  $claimed = New-Object 'System.Collections.Generic.HashSet[string]'
+  foreach ($g in $NpServiceGroups) {
+    $hits = @($services | Where-Object {
+        ($_.Protocol -eq 'tcp' -and $g.Tcp -contains $_.Port) -or
+        ($_.Protocol -eq 'udp' -and $g.Udp -contains $_.Port)
+      })
+    if ($hits.Count -eq 0) { continue }
+    $hostCount = @($hits | ForEach-Object { $_.Host } | Select-Object -Unique).Count
+    $lines.Add('')
+    $lines.Add("== $($g.Name): $hostCount host(s)")
+    foreach ($s in $hits) {
+      [void]$claimed.Add(('{0}/{1}/{2}' -f $s.Protocol, $s.Host, $s.Port))
+      $lines.Add((Format-NpServiceLine $s))
+    }
+  }
+  $other = @($services | Where-Object {
+      -not $claimed.Contains(('{0}/{1}/{2}' -f $_.Protocol, $_.Host, $_.Port))
+    })
+  if ($other.Count -gt 0) {
+    $lines.Add('')
+    $hostCount = @($other | ForEach-Object { $_.Host } | Select-Object -Unique).Count
+    $lines.Add("== Other open ports: $hostCount host(s)")
+    foreach ($s in $other) { $lines.Add((Format-NpServiceLine $s)) }
+  }
+  $base = New-NpOutputBase 'summary'
+  Set-Content -LiteralPath "$base.txt" -Value $lines -Encoding UTF8
+  $lines | Write-Host
+  Write-Host "Saved $base.txt"
+}
+
 function Start-NpSession {
   <#
   .SYNOPSIS
@@ -989,6 +1220,9 @@ function Invoke-NpTcpScan {
     Numbers, lists and ranges: 22,80,'8000-8100' or '1-65535'. Defaults to $NpDefaultPorts.
   .PARAMETER Rate
     Connection attempts started per second, across all targets.
+  .PARAMETER Resume
+    Skip host:port probes that earlier traced runs (-Trace or -Resume) finished, so a scan
+    that was stopped or killed carries on where it left off. Implies -Trace.
   #>
   param(
     [Parameter(Mandatory = $true)][string[]]$Targets,
@@ -997,26 +1231,35 @@ function Invoke-NpTcpScan {
     [int]$Concurrency = 32,
     [double]$Rate = 50,
     [switch]$NoGrab,
-    [switch]$Trace
+    [switch]$Trace,
+    [switch]$Resume
   )
   Assert-NpInScope $Targets
   $portList = ConvertTo-NpPortList $Ports
+  $done = New-Object 'System.Collections.Generic.HashSet[string]'
+  if ($Resume) { [void][NetProbe.TraceLog]::Read((Get-NpTraceFile), $done) }
   $base = New-NpOutputBase 'tcp'
   $tracePath = $null
-  if ($Trace) { $tracePath = "$base-trace.log" }
+  if ($Trace -or $Resume) { $tracePath = "$base-trace.log" }
   $o = New-NpScanOption -TypeName 'NetProbe.TcpOptions' -TimeoutMs $TimeoutMs `
     -Concurrency $Concurrency -Rate $Rate -TracePath $tracePath
   $o.Grab = -not $NoGrab
   $o.TlsPorts = [int[]]$NpTlsPorts
   $o.HttpPorts = [int[]]$NpHttpPorts
-  $total = $Targets.Count * $portList.Count
+  if ($Resume) { $o.Skip = $done }
+  $all = $Targets.Count * $portList.Count
   Write-NpRunHeader -Base $base -Command 'Invoke-NpTcpScan' -Settings @{
-    targets = $Targets.Count; ports = $portList.Count; probes = $total; timeout_ms = $TimeoutMs
-    concurrency = $Concurrency; rate_per_s = $Rate; grab = $o.Grab; trace = [bool]$Trace
+    targets = $Targets.Count; ports = $portList.Count; probes = $all; timeout_ms = $TimeoutMs
+    concurrency = $Concurrency; rate_per_s = $Rate; grab = $o.Grab
+    trace = [bool]$tracePath; resume = [bool]$Resume
   }
-  $minutes = $total / $Rate / 60
-  Write-Host ('{0} connects at up to {1}/s: at least {2:N1} minutes' -f $total, $Rate, $minutes)
   $job = [NetProbe.Scans]::Tcp([string[]]$Targets, [int[]]$portList, $o, "$base.csv")
+  if ($Resume) {
+    Write-Host ('Resume: {0} of {1} probes already finished in earlier traced runs' -f
+      ($all - $job.Total), $all)
+  }
+  $minutes = $job.Total / $Rate / 60
+  Write-Host ('{0} connects at up to {1}/s: at least {2:N1} minutes' -f $job.Total, $Rate, $minutes)
   Wait-NpJob $job 'TCP connect scan'
   $open = @($job.Results | Sort-Object { ConvertTo-NpUInt32 $_.Host }, Port)
   $lines = New-Object System.Collections.Generic.List[string]

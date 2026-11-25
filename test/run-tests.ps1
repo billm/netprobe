@@ -197,5 +197,62 @@ public static class Boom {
   ($LASTEXITCODE -ne 0) -and $logged
 }
 
+function Get-TraceStart {
+  $trace = Get-LatestOutput '*-tcp-trace.log'
+  return (Get-Content -LiteralPath $trace.FullName -TotalCount 1)
+}
+
+Invoke-NpTcpScan -Targets $targets -Ports '30001-30010' -Trace -NoGrab -Rate 200
+Invoke-NpTcpScan -Targets $targets -Ports '30001-30015' -Resume -NoGrab -Rate 200
+Check 'resume skips probes an earlier traced run finished' {
+  (Get-TraceStart) -match 'job start, 10 probes$'
+}
+Invoke-NpTcpScan -Targets $targets -Ports '30001-30015' -Resume -NoGrab -Rate 200
+Check 'resume with nothing left finishes at once' { (Get-TraceStart) -match 'job start, 0 probes$' }
+
+# A run killed mid-write: one probe finished, the next end line cut off.
+Set-Content -LiteralPath (Join-Path $NpOutDir '20000101T000000000Z-tcp-trace.log') -Value @(
+  '2000-01-01T00:00:00.000Z t1 job start, 3 probes',
+  "2000-01-01T00:00:00.100Z t5 start tcp ${lab}:30100",
+  "2000-01-01T00:00:00.200Z t5 end tcp ${lab}:30100 closed",
+  "2000-01-01T00:01:15.500Z t6 start tcp ${lab}:30101",
+  '2000-01-01T00:01:15.600Z t6 end tcp 172.30.9'
+)
+Invoke-NpTcpScan -Targets @($lab) -Ports '30100-30102' -Resume -NoGrab -Rate 200
+Check 'resume ignores a truncated last line from a killed run' {
+  $trace = Get-LatestOutput '*-tcp-trace.log'
+  $lines = Get-Content -LiteralPath $trace.FullName
+  $ends = ($lines | Where-Object { $_ -match ' end tcp ' }) -join ' '
+  ((Get-TraceStart) -match 'job start, 2 probes$') -and ($ends -match ':30101 closed') -and
+  ($ends -notmatch ':30100 ')
+}
+
+Check 'Get-NpHost lists hosts with a port open, across scans and protocols' {
+  (((Get-NpHost -Port 22) -join ',') -eq $lab) -and
+  (((Get-NpHost -Port 22, 587, 6379) -join ',') -eq $lab) -and
+  (((Get-NpHost -Port 161 -Protocol udp) -join ',') -eq $lab) -and
+  (@(Get-NpHost -Port 9).Count -eq 0)
+}
+
+Show-NpSummary
+$summary = @(Get-Content -LiteralPath (Get-LatestOutput '*-summary.txt').FullName)
+$text = $summary -join "`n"
+Check 'summary reports a killed run with its duration and probe count' {
+  $line = $summary | Where-Object { $_ -like '*20000101T000000000Z-tcp-trace.log*' }
+  $line -match 'tcp 00:00:00-00:01:15Z\s+76 s\s+1 of 3\s+killed \(no end line\)'
+}
+Check 'summary reports completed traced runs' { $text -match '8000 of 8000\s+complete' }
+Check 'summary groups services by check, merging TCP and UDP' {
+  $ssh = "== SSH: versions, algorithms, auth methods: 1 host\(s\)\n\s+$lab\s+22/tcp SSH-2\.0"
+  ($text -match $ssh) -and
+  ($text -match "== DNS: 1 host\(s\)\n\s+$lab\s+53/tcp[^\n]*\n\s+$lab\s+53/udp rcode 0") -and
+  ($text -match "== SNMP: 1 host\(s\)\n\s+$lab\s+161/udp sysDescr: netprobe-lab snmpd") -and
+  ($text -match "== Web [^\n]*: 1 host\(s\)\n\s+$lab\s+80/tcp HTTP/1\.1 200") -and
+  ($text -match "== MSSQL: 1 host\(s\)\n\s+$lab\s+1434/udp ServerName;LABSQL")
+}
+Check 'summary lists each open service once despite repeat scans' {
+  @($summary | Where-Object { $_ -match "^\s+$lab\s+22/tcp " }).Count -eq 1
+}
+
 if ($script:failures -gt 0) { Write-Host "$script:failures check(s) failed"; exit 1 }
 Write-Host 'All checks passed'
