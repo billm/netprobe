@@ -57,6 +57,8 @@ namespace NetProbe
         public int TimeoutMs = 1500;
         public int Concurrency = 32;
         public double Rate = 50;
+        // When set, every probe's start and end is appended here as it happens.
+        public string TracePath;
     }
 
     public class TcpOptions : ScanOptions
@@ -122,6 +124,7 @@ namespace NetProbe
         readonly object gate = new object();
         readonly ScanOptions options;
         readonly StreamWriter csv;
+        readonly StreamWriter trace;
         readonly BlockingCollection<Func<object>> queue = new BlockingCollection<Func<object>>(1);
         IEnumerable<Func<object>> work;
         Thread feeder;
@@ -137,6 +140,12 @@ namespace NetProbe
             csv = new StreamWriter(csvPath, false, new UTF8Encoding(false));
             csv.AutoFlush = true;
             csv.WriteLine(Csv.Line(header));
+            if (options.TracePath != null)
+            {
+                trace = new StreamWriter(options.TracePath, false, new UTF8Encoding(false));
+                trace.AutoFlush = true;
+                Trace("job start, " + total + " probes");
+            }
         }
 
         public int Done { get { return Volatile.Read(ref done); } }
@@ -148,6 +157,14 @@ namespace NetProbe
         {
             StateCounts.AddOrUpdate(state, 1, delegate(string k, int v) { return v + 1; });
             if (responded) RespondingHosts.TryAdd(host, 1);
+        }
+
+        public void Trace(string what)
+        {
+            if (trace == null) return;
+            string line = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+                + " t" + Thread.CurrentThread.ManagedThreadId + " " + what;
+            lock (trace) { if (!closed) trace.WriteLine(line); }
         }
 
         public void Start(IEnumerable<Func<object>> items)
@@ -179,7 +196,13 @@ namespace NetProbe
             }
             lock (gate)
             {
-                if (!closed) { csv.Close(); closed = true; }
+                if (!closed)
+                {
+                    Trace("job end, " + Done + " probes done");
+                    csv.Close();
+                    if (trace != null) lock (trace) { trace.Close(); }
+                    closed = true;
+                }
             }
             return true;
         }
@@ -259,7 +282,9 @@ namespace NetProbe
                 string host = h;
                 yield return delegate
                 {
+                    job.Trace("start icmp " + host);
                     var r = IcmpProbe.Probe(host, o.TimeoutMs);
+                    job.Trace("end icmp " + host + " " + r.Status);
                     job.Count(r.Status, host, r.Status == "Success");
                     return r;
                 };
@@ -278,7 +303,9 @@ namespace NetProbe
                     string host = h; int port = p;
                     yield return delegate
                     {
+                        job.Trace("start tcp " + host + ":" + port);
                         var r = TcpProbe.Probe(host, port, o.TimeoutMs, o.Grab, tls, http);
+                        job.Trace("end tcp " + host + ":" + port + " " + r.State);
                         bool responded = r.State == "open" || r.State == "closed";
                         job.Count(r.State, host, responded);
                         return r.State == "open" ? r : null;
@@ -297,12 +324,35 @@ namespace NetProbe
                     string host = h; string probe = p;
                     yield return delegate
                     {
+                        job.Trace("start udp " + host + " " + probe);
                         var r = UdpProbe.Probe(host, probe, o.TimeoutMs, o.Community);
+                        job.Trace("end udp " + host + " " + probe + " " + r.State);
                         job.Count(r.State, host, r.State == "open" || r.State == "closed");
                         return r;
                     };
                 }
             }
+        }
+    }
+
+    // Records any exception that escapes a worker thread. Such an exception ends the
+    // process, so if the process dies with this log empty, something outside killed it.
+    public static class CrashLog
+    {
+        static string logPath;
+
+        public static void Install(string path)
+        {
+            if (logPath == null) AppDomain.CurrentDomain.UnhandledException += OnUnhandled;
+            logPath = path;
+        }
+
+        static void OnUnhandled(object sender, UnhandledExceptionEventArgs e)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(logPath));
+            File.AppendAllText(logPath, DateTime.UtcNow.ToString("u")
+                + " unhandled exception, process terminating: " + e.IsTerminating
+                + Environment.NewLine + e.ExceptionObject + Environment.NewLine);
         }
     }
 
@@ -703,6 +753,7 @@ namespace NetProbe
 if (-not ('NetProbe.Job' -as [type])) {
   Add-Type -TypeDefinition $NpSource -Language CSharp
 }
+[NetProbe.CrashLog]::Install((Join-Path $NpOutDir 'netprobe-crash.log'))
 
 function ConvertTo-NpUInt32 {
   param([Parameter(Mandatory = $true)][string]$Ip)
@@ -840,7 +891,8 @@ function Write-NpRunHeader {
 }
 
 function New-NpScanOption {
-  param([string]$TypeName, [int]$TimeoutMs, [int]$Concurrency, [double]$Rate)
+  param([string]$TypeName, [int]$TimeoutMs, [int]$Concurrency, [double]$Rate,
+    [string]$TracePath)
   if ($Concurrency -lt 1 -or $Rate -le 0 -or $TimeoutMs -lt 1) {
     throw 'TimeoutMs, Concurrency and Rate must be positive'
   }
@@ -848,6 +900,7 @@ function New-NpScanOption {
   $o.TimeoutMs = $TimeoutMs
   $o.Concurrency = $Concurrency
   $o.Rate = $Rate
+  if ($TracePath) { $o.TracePath = $TracePath }
   return $o
 }
 
@@ -907,15 +960,18 @@ function Invoke-NpPing {
     [Parameter(Mandatory = $true)][string[]]$Targets,
     [int]$TimeoutMs = 1000,
     [int]$Concurrency = 16,
-    [double]$Rate = 20
+    [double]$Rate = 20,
+    [switch]$Trace
   )
   Assert-NpInScope $Targets
-  $o = New-NpScanOption -TypeName 'NetProbe.ScanOptions' -TimeoutMs $TimeoutMs `
-    -Concurrency $Concurrency -Rate $Rate
   $base = New-NpOutputBase 'ping'
+  $tracePath = $null
+  if ($Trace) { $tracePath = "$base-trace.log" }
+  $o = New-NpScanOption -TypeName 'NetProbe.ScanOptions' -TimeoutMs $TimeoutMs `
+    -Concurrency $Concurrency -Rate $Rate -TracePath $tracePath
   Write-NpRunHeader -Base $base -Command 'Invoke-NpPing' -Settings @{
     targets = $Targets.Count; timeout_ms = $TimeoutMs
-    concurrency = $Concurrency; rate_per_s = $Rate
+    concurrency = $Concurrency; rate_per_s = $Rate; trace = [bool]$Trace
   }
   $job = [NetProbe.Scans]::Ping([string[]]$Targets, $o, "$base.csv")
   Wait-NpJob $job 'ICMP echo sweep'
@@ -940,20 +996,23 @@ function Invoke-NpTcpScan {
     [int]$TimeoutMs = 1500,
     [int]$Concurrency = 32,
     [double]$Rate = 50,
-    [switch]$NoGrab
+    [switch]$NoGrab,
+    [switch]$Trace
   )
   Assert-NpInScope $Targets
   $portList = ConvertTo-NpPortList $Ports
+  $base = New-NpOutputBase 'tcp'
+  $tracePath = $null
+  if ($Trace) { $tracePath = "$base-trace.log" }
   $o = New-NpScanOption -TypeName 'NetProbe.TcpOptions' -TimeoutMs $TimeoutMs `
-    -Concurrency $Concurrency -Rate $Rate
+    -Concurrency $Concurrency -Rate $Rate -TracePath $tracePath
   $o.Grab = -not $NoGrab
   $o.TlsPorts = [int[]]$NpTlsPorts
   $o.HttpPorts = [int[]]$NpHttpPorts
-  $base = New-NpOutputBase 'tcp'
   $total = $Targets.Count * $portList.Count
   Write-NpRunHeader -Base $base -Command 'Invoke-NpTcpScan' -Settings @{
     targets = $Targets.Count; ports = $portList.Count; probes = $total; timeout_ms = $TimeoutMs
-    concurrency = $Concurrency; rate_per_s = $Rate; grab = $o.Grab
+    concurrency = $Concurrency; rate_per_s = $Rate; grab = $o.Grab; trace = [bool]$Trace
   }
   $minutes = $total / $Rate / 60
   Write-Host ('{0} connects at up to {1}/s: at least {2:N1} minutes' -f $total, $Rate, $minutes)
@@ -989,16 +1048,19 @@ function Invoke-NpUdpProbe {
     [string]$Community = 'public',
     [int]$TimeoutMs = 2000,
     [int]$Concurrency = 16,
-    [double]$Rate = 20
+    [double]$Rate = 20,
+    [switch]$Trace
   )
   Assert-NpInScope $Targets
-  $o = New-NpScanOption -TypeName 'NetProbe.UdpOptions' -TimeoutMs $TimeoutMs `
-    -Concurrency $Concurrency -Rate $Rate
-  $o.Community = $Community
   $base = New-NpOutputBase 'udp'
+  $tracePath = $null
+  if ($Trace) { $tracePath = "$base-trace.log" }
+  $o = New-NpScanOption -TypeName 'NetProbe.UdpOptions' -TimeoutMs $TimeoutMs `
+    -Concurrency $Concurrency -Rate $Rate -TracePath $tracePath
+  $o.Community = $Community
   Write-NpRunHeader -Base $base -Command 'Invoke-NpUdpProbe' -Settings @{
     targets = $Targets.Count; probes = ($Probes -join ','); community = $Community
-    timeout_ms = $TimeoutMs; concurrency = $Concurrency; rate_per_s = $Rate
+    timeout_ms = $TimeoutMs; concurrency = $Concurrency; rate_per_s = $Rate; trace = [bool]$Trace
   }
   $job = [NetProbe.Scans]::Udp([string[]]$Targets, [string[]]$Probes, $o, "$base.csv")
   Wait-NpJob $job 'UDP probes'

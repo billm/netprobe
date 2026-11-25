@@ -85,6 +85,20 @@ Each scan writes to `$HOME\Documents\netpen\`:
 UDP states: `open` (a reply), `closed` (ICMP port unreachable), `open|filtered` (no reply).
 TCP states: `open`, `closed` (refused), `filtered` (timeout or other error).
 
+## When a scan dies
+
+- `netprobe-crash.log` in the output folder records any exception that escapes netprobe's
+  worker threads, the only way its own code can end the process. If PowerShell exits and this
+  file doesn't exist, something outside netprobe ended it (EDR, for example).
+- `-Trace` on any scan writes `<UTC stamp>-<scan>-trace.log`: a timestamped line as each probe
+  starts and ends, flushed as written. After a kill, the `start` lines without a matching `end`
+  are the probes in flight. Expect about 100 bytes per probe.
+
+```powershell
+$log = Get-ChildItem $HOME\Documents\netpen\*-trace.log | Select-Object -Last 1
+Get-Content $log.FullName -Tail 40
+```
+
 ## Testing
 
 `test/check.sh` runs every check (needs Docker and the .NET SDK):
@@ -95,7 +109,7 @@ TCP states: `open`, `closed` (refused), `filtered` (timeout or other error).
    (`PSScriptAnalyzerSettings.psd1`)
 3. ruff on the lab's Python
 4. `test/run-tests.ps1` in PowerShell 7 against a Docker lab: one host with SSH, nginx (HTTP
-   and TLS), Redis, an FTP greeting, dnsmasq, tftp-hpa, chrony, net-snmp and canned
+   and TLS), Redis, FTP and SMTP (587) greetings, dnsmasq, tftp-hpa, chrony, net-snmp and canned
    NetBIOS/IPMI/SQL Browser responders; and one host with nothing listening
 
 The lab runs on Linux, where unconnected UDP sockets don't see ICMP port unreachable, so the

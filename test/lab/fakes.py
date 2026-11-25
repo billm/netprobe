@@ -1,6 +1,6 @@
 """Canned responders for protocols the lab has no real server for.
 
-TCP 21: FTP greeting. UDP 137: NetBIOS node status. UDP 623: IPMI channel auth
+TCP 21 and 587: FTP and SMTP greetings. UDP 137: NetBIOS node status. UDP 623: IPMI channel auth
 capabilities. UDP 1434: SQL Server Browser instance list.
 """
 
@@ -47,21 +47,23 @@ def udp_server(port: int, handler) -> None:
         sock.sendto(handler(data), addr)
 
 
-def ftp_server() -> None:
+def banner_server(port: int, banner: bytes) -> None:
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", 21))
+    srv.bind(("0.0.0.0", port))
     srv.listen(16)
     while True:
         conn, _ = srv.accept()
-        conn.sendall(b"220 netprobe-lab FTP ready\r\n")
+        conn.sendall(banner)
         conn.close()
 
 
 def main() -> None:
     for port, handler in ((137, nbns_reply), (623, ipmi_reply), (1434, mssql_reply)):
         threading.Thread(target=udp_server, args=(port, handler), daemon=True).start()
-    ftp_server()
+    smtp = (587, b"220 netprobe-lab ESMTP ready\r\n")
+    threading.Thread(target=banner_server, args=smtp, daemon=True).start()
+    banner_server(21, b"220 netprobe-lab FTP ready\r\n")
 
 
 if __name__ == "__main__":

@@ -148,5 +148,54 @@ Check 'rate limit holds: 40 connects at 20/s take about 2 s' {
   ($s -ge 1.8) -and ($s -lt 4)
 }
 
+Invoke-NpTcpScan -Targets $targets -Ports @(21, 587, 1) -Rate 200 -Trace
+$traceCsv = Get-LatestOutput '*-tcp.csv'
+$trace = @(Get-Content ($traceCsv.FullName -replace '\.csv$', '-trace.log'))
+Check 'trace logs a start and an end for every probe, between job start and end' {
+  $starts = @($trace | Where-Object { $_ -match ' start tcp ' })
+  $ends = @($trace | Where-Object { $_ -match ' end tcp ' })
+  ($trace[0] -match 'job start, 6 probes$') -and ($trace[-1] -match 'job end, 6 probes done$') -and
+  ($starts.Count -eq 6) -and ($ends.Count -eq 6) -and
+  (@($trace | Where-Object { $_ -match "end tcp ${lab}:587 open$" }).Count -eq 1)
+}
+Check 'SMTP submission greeting grabbed on 587' {
+  $smtp = Import-Csv $traceCsv.FullName | Where-Object Port -eq '587'
+  $smtp.Banner -like '220 netprobe-lab ESMTP*'
+}
+
+Check 'stress: 8,000 probes with grabs finish, with no crash log' {
+  Invoke-NpTcpScan -Targets $targets -Ports '1-4000' -Rate 1000 -Concurrency 32 -Trace
+  $csv = Get-LatestOutput '*-tcp.csv'
+  $txt = Get-Content ($csv.FullName -replace '\.csv$', '.txt') -Raw
+  $ends = @(Get-Content ($csv.FullName -replace '\.csv$', '-trace.log') |
+      Where-Object { $_ -match ' end tcp ' })
+  ($txt -match 'closed 7994, open 6') -and ($ends.Count -eq 8000) -and
+  -not (Test-Path (Join-Path $NpOutDir 'netprobe-crash.log'))
+}
+
+Check 'an exception escaping a worker thread is written to the crash log' {
+  $log = Join-Path $tmp 'child-crash.log'
+  $child = Join-Path $tmp 'crash-child.ps1'
+  Set-Content -LiteralPath $child -Value @'
+. /work/netprobe.ps1
+[NetProbe.CrashLog]::Install($args[0])
+Add-Type -TypeDefinition @"
+public static class Boom {
+    public static void Go() {
+        var t = new System.Threading.Thread(delegate() {
+            throw new System.InvalidOperationException("netprobe crash test");
+        });
+        t.Start();
+        t.Join();
+    }
+}
+"@
+[Boom]::Go()
+'@
+  & pwsh -NoProfile -File $child $log 2>&1 | Out-Null
+  $logged = (Get-Content $log -Raw) -match 'InvalidOperationException: netprobe crash test'
+  ($LASTEXITCODE -ne 0) -and $logged
+}
+
 if ($script:failures -gt 0) { Write-Host "$script:failures check(s) failed"; exit 1 }
 Write-Host 'All checks passed'
