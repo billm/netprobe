@@ -1,0 +1,33 @@
+# Test lab for netprobe.ps1: a host running the services it probes, a host with nothing
+# listening, and a PowerShell runner. Run with test/run-lab.sh.
+name: netprobe-lab
+networks:
+  lab:
+    ipam:
+      config:
+        - subnet: 172.30.99.0/24
+services:
+  services:
+    build: lab
+    networks:
+      lab:
+        ipv4_address: 172.30.99.10
+  empty:
+    image: alpine:3.22
+    command: ["sleep", "infinity"]
+    networks:
+      lab:
+        ipv4_address: 172.30.99.11
+  runner:
+    build: runner
+    platform: linux/amd64
+    depends_on: [services, empty]
+    working_dir: /work
+    volumes:
+      - ..:/work:ro
+    environment:
+      HOME: /tmp/home
+    command: ["pwsh", "-NoProfile", "-File", "/work/test/run-tests.ps1"]
+    networks:
+      lab:
+        ipv4_address: 172.30.99.5
